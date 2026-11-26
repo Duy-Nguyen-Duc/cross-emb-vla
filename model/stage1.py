@@ -1,0 +1,464 @@
+import os
+from typing import Dict
+import math
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.autograd import Function
+
+from model.modules.blocks import (
+    BasicTransformerBlock,
+    VectorQuantizer,
+    ProgressPosEnc,
+    ResidualTemporalBlock,
+    DeConv1dBlock
+)
+
+import matplotlib.pyplot as plt
+
+# Encoder: Local Attention Transformer + Downsampling
+class LocalTransformerEncoder(nn.Module):
+    def __init__(
+        self,
+        state_dim: int = 10,
+        model_dim: int = 256,
+        latent_dim: int = 64,
+        depth_high: int = 2,
+        num_heads: int = 8,
+        dropout: float = 0.1,
+        local_w: int = 12,
+        downsample_factor: int = 2,
+    ):
+        super().__init__()
+        self.local_w = local_w
+        self.downsample_factor = int(downsample_factor)
+
+        self.in_proj = nn.Linear(state_dim, model_dim)
+        self.pos_emb_enc = ProgressPosEnc(d_model=model_dim)
+
+        self.blocks_high = nn.ModuleList([
+            BasicTransformerBlock(
+                dim=model_dim,
+                num_attention_heads=num_heads,
+                attention_head_dim=model_dim // num_heads,
+                dropout=dropout,
+            )
+            for _ in range(depth_high)
+        ])
+
+        assert self.downsample_factor > 1 and math.log2(self.downsample_factor).is_integer(), \
+            "downsample_factor must be a power of 2 (> 1)"
+        n = int(math.log2(self.downsample_factor))
+        strides = [2] * n + [1]
+        kernel_sizes = [5] + [3] * n
+
+        self.conv_down = ResidualTemporalBlock(
+            inp_channels=model_dim,
+            out_channels=model_dim,
+            kernel_size=kernel_sizes,
+            stride=strides,
+            n_groups=8,
+            causal=False,
+            residual=False,
+            pooling_layers=[],
+        )
+
+        self.to_latent = nn.Linear(model_dim, latent_dim)
+
+    def forward(
+        self,
+        x: torch.Tensor,           # [B, H, state_dim]
+        progress: torch.Tensor = None,  # [B, H] in [0,1]
+        causal: bool = False,
+    ) -> torch.Tensor:
+        B, H, _ = x.shape
+        h = self.in_proj(x)  # [B, H, D]
+
+        # add progress PE
+        if progress is not None:
+            if progress.dim() == 3:
+                p = progress.view(B, H)
+            else:
+                p = progress  # [B, H]
+            pos_full = self.pos_emb_enc(p)  # [B, H, D]
+            h = h + pos_full
+
+        if len(self.blocks_high) > 0:
+            band_mask_bool = build_sliding_window_mask(H, self.local_w, causal=causal, device=h.device)
+            attn_mask_high = to_attn_mask_for_torch(band_mask_bool)
+            for blk in self.blocks_high:
+                h = blk(hidden_states=h, attention_mask=attn_mask_high)
+
+        h = self.conv_down(h)
+
+        z_e = self.to_latent(h)  # [B, H_ds, latent_dim]
+        return z_e
+
+
+# Decoder: Upsampling + Local Attention Transformer
+class LocalTransformerDecoder(nn.Module):
+    def __init__(
+        self,
+        state_dim: int = 10,
+        model_dim: int = 256,
+        latent_dim: int = 64,
+        depth_high: int = 4,
+        num_heads: int = 8,
+        dropout: float = 0.1,
+        local_w: int = 12,
+        downsample_factor: int = 2,
+    ):
+        super().__init__()
+        self.local_w = local_w
+        self.downsample_factor = int(downsample_factor)
+
+        self.from_latent = nn.Linear(latent_dim, model_dim)
+        self.pos_emb_dec = ProgressPosEnc(d_model=model_dim)
+
+        self.deconv = DeConv1dBlock(
+            inp_channels=model_dim,
+            out_channels=model_dim,
+            kernel_size=4,
+            stride=self.downsample_factor,
+            n_groups=8,
+            causal=False,
+        )
+
+        self.blocks_high = nn.ModuleList([
+            BasicTransformerBlock(
+                dim=model_dim,
+                num_attention_heads=num_heads,
+                attention_head_dim=model_dim // num_heads,
+                dropout=dropout,
+            )
+            for _ in range(depth_high)
+        ])
+
+        self.to_state = nn.Linear(model_dim, state_dim)
+
+    def forward(
+        self,
+        z_q: torch.Tensor,            # [B, H_ds, latent_dim]
+        progress: torch.Tensor = None,  # [B, H]
+        causal: bool = False,
+    ) -> torch.Tensor:
+        B, H_ds, _ = z_q.shape
+        h = self.from_latent(z_q)  # [B, H_ds, D]
+
+        if progress is not None:
+            if progress.dim() == 3:
+                p = progress.view(B, -1)
+            else:
+                p = progress  # [B, H]
+            H = p.size(1)
+        else:
+            H = H_ds * self.downsample_factor
+            p = None
+
+        h_t = h.transpose(1, 2)           # [B, D, H_ds]
+        h_up_t = self.deconv(h_t)         # [B, D, H_up]
+        h = h_up_t.transpose(1, 2)        # [B, H_up, D]
+        H_up = h.size(1)
+
+        if H_up != H:
+            h = F.interpolate(
+                h.transpose(1, 2), size=H, mode="linear", align_corners=False
+            ).transpose(1, 2)
+
+        if p is not None:
+            pos_dec = self.pos_emb_dec(p)  # [B, H, D]
+            # h = h + pos_dec
+
+        if len(self.blocks_high) > 0:
+            band_mask_bool_high = build_sliding_window_mask(H, self.local_w, causal=causal, device=h.device)
+            attn_mask_high = to_attn_mask_for_torch(band_mask_bool_high)
+            for blk in self.blocks_high:
+                h = blk(hidden_states=h, attention_mask=attn_mask_high)
+
+        x_hat = self.to_state(h)  # [B, H, state_dim]
+        return x_hat
+
+# Action motif autoencoder backbone: encoder, codebook, decoder; forward and loss live in the subclass
+class MotifTokenizer(nn.Module):
+    def __init__(
+        self,
+        state_dim: int = 10,
+        model_dim: int = 256,
+        latent_dim: int = 64,
+        codebook_size: int = 512,
+        depth_enc: int = 4,
+        depth_dec: int = 4,
+        num_heads: int = 8,
+        dropout: float = 0.1,
+        local_w: int = 12,
+        downsample_factor: int = 2,
+    ):
+        super().__init__()
+        self.codebook_size = codebook_size
+        self.downsample_factor = int(downsample_factor)
+
+        self.encoder = LocalTransformerEncoder(
+            state_dim=state_dim,
+            model_dim=model_dim,
+            latent_dim=latent_dim,
+            depth_high=depth_enc,
+            num_heads=num_heads,
+            dropout=dropout,
+            local_w=local_w,
+            downsample_factor=self.downsample_factor,
+        )
+
+        self.vq = VectorQuantizer(
+            num_latents=codebook_size,
+            latent_dim=latent_dim,
+            code_restart=True,
+        )
+
+        self.decoder = LocalTransformerDecoder(
+            state_dim=state_dim,
+            model_dim=model_dim,
+            latent_dim=latent_dim,
+            depth_high=depth_dec,
+            num_heads=num_heads,
+            dropout=dropout,
+            local_w=local_w,
+            downsample_factor=self.downsample_factor,
+        )
+
+    def compute_code_usage(self, indices) -> float:
+        unique, counts = torch.unique(indices, return_counts=True)
+        index_counts = torch.zeros(
+            self.codebook_size, dtype=torch.long, device=unique.device
+        )
+        index_counts[unique] = counts
+        code_usage = (index_counts != 0).float().mean()
+        return code_usage
+
+    def _counts_from_indices(self, indices: torch.Tensor) -> torch.Tensor:
+        """
+        indices: [B, H_ds] or any shape of code indices
+        return: counts [K]
+        """
+        flat = indices.reshape(-1)
+        counts = torch.bincount(flat, minlength=self.codebook_size).float()
+        return counts
+
+    def compute_perplexity(self, indices: torch.Tensor, eps: float = 1e-10) -> torch.Tensor:
+        """
+        perplexity = exp( -sum p log p )
+        """
+        counts = self._counts_from_indices(indices)
+        total = counts.sum().clamp_min(1.0)
+        p = counts / total
+        entropy = -(p * (p + eps).log()).sum()
+        perplexity = entropy.exp()
+        return perplexity
+
+    def compute_topk_usage(self, indices: torch.Tensor, ks=(10, 20)) -> Dict[str, torch.Tensor]:
+        """
+        calculates the fraction of the codebook that is used in the top k most frequent codes
+        """
+        counts = self._counts_from_indices(indices)
+        total = counts.sum().clamp_min(1.0)
+        sorted_counts, _ = torch.sort(counts, descending=True)
+        out = {}
+        for k in ks:
+            k = min(k, self.codebook_size)
+            frac = sorted_counts[:k].sum() / total
+            out[f"top{k}_frac"] = frac
+        return out
+
+    def plot_and_reset_code_usage(self, epoch: int, path):
+        """
+        plots the usage distribution of the codebook and resets the usage
+        """
+        plot_usage_distribution(self.vq.usage, os.path.join(path, f"train_usage_unsorted_epoch{epoch:03d}.png"))
+        plot_usage_distribution(self.vq.usage.sort().values, os.path.join(path, f"train_usage_sorted_epoch{epoch:03d}.png"))
+        self.vq.random_restart()
+        self.vq.reset_usage()
+
+class GradientReversal(Function):
+    """
+    GRL Layer: Forward propagation remains unchanged, backward propagation reverses the gradient (multiplied by -alpha).
+    Makes the Encoder's update direction "maximize the Discriminator's Loss".
+    """
+    @staticmethod
+    def forward(ctx, x, alpha):
+        ctx.save_for_backward(x)
+        ctx.alpha = alpha
+        return x
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        grad_input = None
+        if ctx.needs_input_grad[0]:
+            # Reverse gradient
+            grad_input = - ctx.alpha * grad_output
+        return grad_input, None
+
+
+class ConditionalEmbodimentDiscriminator(nn.Module):
+    """Embodiment discriminator conditioned on (task, progress bin)."""
+
+    def __init__(self, input_dim: int, num_robots: int, num_tasks: int = 6,
+                 num_progress_bins: int = 4, cond_dim: int = 32, hidden: int = 256):
+        super().__init__()
+        self.num_progress_bins = num_progress_bins
+        self.task_emb = nn.Embedding(num_tasks + 1, cond_dim)   # +1 = unknown task
+        self.prog_emb = nn.Embedding(num_progress_bins, cond_dim)
+        self.net = nn.Sequential(
+            nn.Linear(input_dim + 2 * cond_dim, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden), nn.ReLU(),
+            nn.Linear(hidden, num_robots),
+        )
+
+    def forward(self, z, task_ids, progress, alpha: float = 1.0):
+        """z: [N, D]; task_ids: [N] long; progress: [N] float in [0, 1]."""
+        z = GradientReversal.apply(z, alpha)
+        bins = torch.clamp((progress * self.num_progress_bins).long(),
+                           0, self.num_progress_bins - 1)
+        h = torch.cat([z, self.task_emb(task_ids), self.prog_emb(bins)], dim=-1)
+        return self.net(h)
+
+
+class LabelRemapper:
+    def __init__(self, valid_ids, device='cpu'):
+        """
+        valid_ids: list, e.g., [0, 1, 3]
+        """
+        self.device = device
+        max_id = max(valid_ids)
+
+        self.table = torch.full((max_id + 1,), -1, dtype=torch.long, device=device)
+
+        for new_id, old_id in enumerate(valid_ids):
+            self.table[old_id] = new_id
+
+    def __call__(self, targets):
+        return self.table[targets]
+
+def compute_cross_robot_infonce(
+    z_e: torch.Tensor,          # [B, H_ds, D]
+    languages: list,            # len=B, positive-group label per sample
+    progress: torch.Tensor,     # [B, 1] or [B, H]
+    tau: float = 0.1,
+    sigma: float = 0.02,
+    eps: float = 1e-8,
+    min_weight: float = 0.0,
+):
+    """
+    Multi-positive InfoNCE:
+      positives: same label & close progress (soft gaussian weight)
+      negatives: all others in batch
+      min_weight: soft weights below this are zeroed (0 disables the cutoff).
+
+    Returns:
+      loss (scalar), stats dict
+    """
+    device = z_e.device
+    B = z_e.size(0)
+
+    # 1) pool latent to one embedding per sample
+    emb = z_e.mean(dim=1)                 # [B, D]
+    emb = F.normalize(emb, dim=-1)        # cosine space
+
+    # 2) similarity matrix
+    sim = emb @ emb.t()                  # [B, B]
+    sim = sim / tau
+
+    # mask out self
+    eye = torch.eye(B, device=device).bool()
+    sim = sim.masked_fill(eye, -1e9)
+
+    # 3) build positive weights W_ij
+    # same language matrix
+    lang_eq = torch.zeros((B, B), device=device, dtype=torch.bool)
+    for i in range(B):
+        for j in range(B):
+            if i != j and languages[i] == languages[j]:
+                lang_eq[i, j] = True
+
+    # progress distance
+    p0 = progress[:, 0]              # [B]
+
+    dp = (p0[:, None] - p0[None, :]).abs()  # [B, B]
+
+    # soft gaussian weight
+    W = lang_eq.float() * torch.exp(-(dp / sigma) ** 2)
+    if min_weight > 0:
+        W = W * (W >= min_weight).float()
+
+    # ensure no self-positive
+    W = W.masked_fill(eye, 0.0)
+
+    # 4) multi-positive InfoNCE
+    # numerator_i = sum_j W_ij * exp(sim_ij)
+    exp_sim = torch.exp(sim)  # [B,B]
+    num = (W * exp_sim).sum(dim=1)  # [B]
+    den = exp_sim.sum(dim=1) + eps  # [B]
+
+    # only keep anchors that have any positives
+    has_pos = (W.sum(dim=1) > 0)
+    if has_pos.any():
+        loss = -torch.log((num[has_pos] + eps) / den[has_pos]).mean()
+    else:
+        loss = torch.tensor(0.0, device=device)
+
+    stats = {
+        "infonce_loss": loss.detach(),
+        "pos_per_anchor": W.sum(dim=1).mean().detach(),
+        "valid_anchor_frac": has_pos.float().mean().detach(),
+        "avg_dp_pos": (dp * (W > 0)).sum() / ((W > 0).sum() + eps),
+    }
+    return loss, stats
+
+
+# sliding-window attention mask
+def build_sliding_window_mask(H: int, w: int, causal: bool = False, device=None):
+    """
+    Returns a boolean mask [H, H]; True = allow attention; False = mask out.
+    - Non-causal: |i - j| < w//2 + (w % 2)
+    - Causal: j <= i AND (i - j) < w
+    """
+    i = torch.arange(H, device=device).unsqueeze(1)  # [H,1]
+    j = torch.arange(H, device=device).unsqueeze(0)  # [1,H]
+    if causal:
+        mask = (j <= i) & ((i - j) < w)
+    else:
+        left = (w - 1) // 2
+        right = w - 1 - left
+        mask = ((j - i) >= -left) & ((j - i) <= right)
+    return mask  # [H,H] bool (True=keep)
+
+
+def to_attn_mask_for_torch(mask_bool: torch.Tensor):
+    """
+    PyTorch MHA Tensor mask: True means 'do not attend'.
+    """
+    return ~mask_bool
+
+
+def plot_usage_distribution(usage, saved_path):
+    data = usage.cpu().numpy()
+    n = 1
+    for n in range(1, 10):
+        if (2 ** n) ** 2 <= len(data) < (2 ** (n + 1)) ** 2:
+            break
+    # Zero-pad the codebook size to a multiple of 2**n so it reshapes to a grid.
+    rows = 2 ** n
+    if len(data) % rows:
+        data = np.concatenate([data, np.zeros(rows - len(data) % rows, dtype=data.dtype)])
+    data = data.reshape(rows, -1)
+    fig, ax = plt.subplots()
+    cax = ax.matshow(data, interpolation="nearest")
+    fig.colorbar(cax)
+    plt.axis("off")
+    plt.gca().set_axis_off()
+    plt.subplots_adjust(top=1, bottom=0, right=1, left=0, hspace=0, wspace=0)
+    plt.margins(0, 0)
+    plt.gca().xaxis.set_major_locator(plt.NullLocator())
+    plt.gca().yaxis.set_major_locator(plt.NullLocator())
+    plt.savefig(saved_path, bbox_inches="tight", pad_inches=0.0)
+    plt.close()

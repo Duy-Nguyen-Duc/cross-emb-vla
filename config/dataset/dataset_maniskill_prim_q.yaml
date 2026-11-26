@@ -1,0 +1,45 @@
+# ManiSkill demos of panda / xarm6 / widowxai with primitive labels and joint positions (batch["qpos"]).
+# data_config_suffix: "_q" for stages 1-2 (joint trajectories in the batch), "_geo" for stage 3 (raw tcp pose for
+# the geometry tokens).
+data_config_suffix: "_q"
+dataset_path:
+  - ./demo_data/maniskill/processed/panda
+  - ./demo_data/maniskill/processed/xarm6
+  - ./demo_data/maniskill/processed/widowxai
+embodiment_tag:
+  - panda_rel
+  - xarm6_rel
+  - widowxai_rel
+data_config:
+  - panda_rel_prim${dataset.data_config_suffix}
+  - xarm6_rel_prim${dataset.data_config_suffix}
+  - widowxai_rel_prim${dataset.data_config_suffix}
+video_backend:
+  - decord
+  - decord
+  - decord
+
+# K-shot transfer pairs: the first K demos; other pairs keep all 50.
+modifiy_tasks_num:
+  - "Push the cube across the surface to the target location.": ${K}
+    "Pick up the sphere and place it precisely into the target.": ${K}
+  - "Pull the cube toward the target marker.": ${K}
+    "Lift the peg and stand it upright.": ${K}
+  - "Pick up the cube.": ${K}
+    "Stack the cube on top of the other cube.": ${K}
+
+drop_video: false                               # stage 1 sets true, since it only requires the input trajectory (qpos)
+frame_cache_root: ./demo_data/maniskill/frame_cache  # data/process/prextract_frames.py
+
+window_size: ${window_size}
+sampling_weights: null
+batch_size: ${batch_size}
+num_workers: 16
+prefetch_factor: 1
+pin_memory: false
+drop_last: true
+persistent_workers: false
+shuffle: true
+balance_tasks: ${balance_tasks}
+collator:
+  normalize_images: true

@@ -1,0 +1,11 @@
+stage1:                         # the tokenizer itself is read from models.stage2.vq_vae_ckpt
+  latent_dim: 256
+
+stage2:
+  class_name: Stage2MotifPredictor
+  vq_vae_ckpt: null
+  model_dim: 512
+  perceiver_depth: 6
+  perceiver_heads: 8
+  perceiver_dim_head: 64
+  perceiver_max_tokens: 1000
